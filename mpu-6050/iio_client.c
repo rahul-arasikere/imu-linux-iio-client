@@ -1,447 +1,265 @@
-/*
- * libiio - Dummy IIO streaming example
+/** @file icm20608d.c
  *
- * This example libiio program is meant to exercise the features of IIO present
- * in the sample dummy IIO device. For buffered access it relies on the hrtimer
- * trigger but could be modified to use the sysfs trigger. No hardware should
- * be required to run this program.
+ * @brief Main file for iio icm20608 daemon
  *
- * Copyright (c) 2016, DAQRI. All rights reserved.
- * Author: Lucas Magasweran <lucas.magasweran@daqri.com>
- *
- * Based on AD9361 example:
- * Copyright (C) 2014 IABG mbH
- * Author: Michael Feilen <feilen_at_iabg.de>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * @par
  */
 
-/*
- * How to setup the sample IIO dummy device and hrtimer trigger:
- *
- * 1. Check if `configfs` is already mounted
- *
- * $ mount | grep 'config'
- * configfs on /sys/kernel/config type configfs (rw,relatime)
- *
- * 1.b. Mount `configfs` if it is not already mounted
- *  $ sudo mount -t configfs none /sys/kernel/config
- *
- * 2. Load modules one by one
- *
- * $ sudo modprobe industrialio
- * $ sudo modprobe industrialio-configfs
- * $ sudo modprobe industrialio-sw-device
- * $ sudo modprobe industrialio-sw-trigger
- * $ sudo modprobe iio-trig-hrtimer
- * $ sudo modprobe iio_dummy
- *
- * 3. Create trigger and dummy device under `/sys/kernel/config`
- *
- * $ sudo mkdir /sys/kernel/config/iio/triggers/hrtimer/instance1
- * $ sudo mkdir /sys/kernel/config/iio/devices/dummy/my_dummy_device
- *
- * 4. Run `iio_info` to see that all worked properly
- *
- * $ iio_info
- * Library version: 0.14 (git tag: c9909f2)
- * Compiled with backends: local xml ip
- * IIO context created with local backend.
- * Backend version: 0.14 (git tag: c9909f2)
- * Backend description string: Linux ...
- * IIO context has 1 attributes:
- *         local,kernel: 4.13.0-39-generic
- * IIO context has 2 devices:
- *         iio:device0: my_dummy_device
- *                 10 channels found:
- *                         activity_walking:  (input)
- *                         1 channel-specific attributes found:
- *                                 attr  0: input value: 4
- * ...
- *
- **/
-
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <signal.h>
-#include <stdio.h>
-#include <errno.h>
+#include <syslog.h>
+#include <unistd.h>
 #include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <string.h>
+#include <stdbool.h>
 #include <inttypes.h>
+
+#include <sys/signalfd.h>
+#include <sys/epoll.h>
+
 #include <iio.h>
 
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#include <endian.h>
 
-#define IIO_ENSURE(expr)                                                             \
-    {                                                                                \
-        if (!(expr))                                                                 \
-        {                                                                            \
-            (void)fprintf(stderr, "assertion failed (%s:%d)\n", __FILE__, __LINE__); \
-            (void)abort();                                                           \
-        }                                                                            \
-    }
+#include "daemonize.h"
+#include "libiio-loop.h"
+#include "local-loop.h"
 
-static char *name = "mpu6050";
-static char *trigger_str = "trigger0";
-static int buffer_length = 1;
-static int count = -1;
+#ifdef DEBUG
+#define debug_printf(format, ...) fprintf(stderr, "%s:%s:%d: " format, __FILE__, __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#define debug_printf_n(format, ...) debug_printf(format "\n", ##__VA_ARGS__)
+#else
+#define debug_printf_n(format, ...) \
+    do                              \
+    {                               \
+    } while (0)
+#define debug_printf(format, ...) \
+    do                            \
+    {                             \
+    } while (0)
+#endif
 
-// libiio supports multiple methods for reading data from a buffer
-enum
+static int verbose_flag = 0;
+static int no_daemon_flag = 0;
+static int kill_flag = 0;
+static int hup_flag = 0;
+
+/** signal fd */
+int sigfd;
+
+/** /dev/null fd*/
+int devnullfd;
+
+/** logging */
+#ifdef DEBUG
+int log_level = LOG_DEBUG;
+#else
+int log_level = LOG_INFO;
+#endif
+
+static char *pidFile = "/var/run/icm20608d.pid";
+
+#define PACKAGE_NAME "icm20608d"
+
+static struct option long_options[] =
+    {
+        {"verbose", no_argument, &verbose_flag, 'V'},
+        {"version", no_argument, 0, 'v'},
+        {"log-level", required_argument, 0, 'l'},
+        {"n", no_argument, &no_daemon_flag, 'n'},
+        {"kill", no_argument, &kill_flag, 'k'},
+        {"hup", no_argument, &hup_flag, 'H'},
+        {"pid", required_argument, 0, 'p'},
+        {"uri", required_argument, 0, 'u'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}};
+
+/**************************************************************************
+ *    Function: Print Usage
+ *    Description:
+ *        Output the command-line options for this daemon.
+ *    Params:
+ *        @argc - Standard argument count
+ *        @argv - Standard argument array
+ *    Returns:
+ *        returns void always
+ **************************************************************************/
+void PrintUsage(int argc, char *argv[])
 {
-    BUFFER_POINTER,
-    SAMPLE_CALLBACK,
-    CHANNEL_READ_RAW,
-    CHANNEL_READ,
-    MAX_READ_METHOD,
-};
-static int buffer_read_method = CHANNEL_READ;
-
-// Streaming devices
-static struct iio_device *dev;
-
-/* IIO structs required for streaming */
-static struct iio_context *ctx;
-static struct iio_buffer *rxbuf;
-static struct iio_channel **channels;
-static unsigned int channel_count;
-
-static bool stop;
-static bool has_repeat;
-
-/* cleanup and exit */
-static void shutdown()
-{
-    int ret;
-
-    if (channels)
+    argv = argv;
+    if (argc >= 1)
     {
-        free(channels);
+        printf(
+            "./icm20608d [-u ip:<IP>] icm20608"
+            "-v, --version              prints version and exits\n"
+            "-V, --verbose              be more verbose\n"
+            "-l, --log-level            set log level[default=LOG_INFO]\n"
+            "-n                         don\'t fork off as daemon\n"
+            "-k, --kill                 kill old daemon instance in case if present\n"
+            "-H, --hup                  send daemon signal to reload configuration\n"
+            "-p, --pid                  path to pid file[default=%s]\n"
+            "-u, --uri=URI              use the context with the provided URI\n"
+            "-h, --help                 prints this message\n",
+            pidFile);
     }
-
-    printf("* Destroying buffers\n");
-    if (rxbuf)
-    {
-        iio_buffer_destroy(rxbuf);
-    }
-
-    printf("* Disassociate trigger\n");
-    if (dev)
-    {
-        ret = iio_device_set_trigger(dev, NULL);
-        if (ret < 0)
-        {
-            char buf[256];
-            iio_strerror(-ret, buf, sizeof(buf));
-            fprintf(stderr, "%s while Disassociate trigger\n", buf);
-        }
-    }
-
-    printf("* Destroying context\n");
-    if (ctx)
-    {
-        iio_context_destroy(ctx);
-    }
-    exit(0);
 }
 
-static void handle_sig(int sig)
+/**************************************************************************
+ *    Function: Print daemon version
+ *    Description:
+ *        Output the command-line options for this daemon.
+ *    Params:
+ *    Returns:
+ *        returns string with version
+ **************************************************************************/
+char *daemon_version()
 {
-    printf("Waiting for process to finish... got signal : %d\n", sig);
-    stop = true;
+    static char version[31] = {0};
+    snprintf(version, sizeof(version), "%d.%d.%d\n", 0, 0, 0);
+    return version;
 }
 
-static ssize_t sample_cb(const struct iio_channel *chn, void *src, size_t bytes, __notused void *d)
+/**************************************************************************
+ *    Function: main
+ *    Description:
+ *        The c standard 'main' entry point function.
+ *    Params:
+ *        @argc - count of command line arguments given on command line
+ *        @argv - array of arguments given on command line
+ *    Returns:
+ *        returns integer which is passed back to the parent process
+ **************************************************************************/
+int main(int argc, char **argv)
 {
-    const struct iio_data_format *fmt = iio_channel_get_data_format(chn);
-    unsigned int j, repeat = has_repeat ? fmt->repeat : 1;
+    int daemon_flag = 1; //daemonizing by default
+    int c = -1;
+    int option_index = 0;
 
-    printf("%s ", iio_channel_get_id(chn));
-    for (j = 0; j < repeat; ++j)
-    {
-        if (bytes == sizeof(int16_t))
-            printf("%" PRIi16 " ", ((int16_t *)src)[j]);
-        else if (bytes == sizeof(int64_t))
-            printf("%" PRId64 " ", ((int64_t *)src)[j]);
-    }
+    int errsv = 0;
+    int ret = 0;
 
-    return bytes * repeat;
-}
+    char *uri = "";
+    char *device = "";
 
-static void usage(__notused int argc, char *argv[])
-{
-    printf("Usage: %s [OPTION]\n", argv[0]);
-    printf("  -d\tdevice name (default \"iio_dummy_part_no\")\n");
-    printf("  -t\ttrigger name (default \"instance1\")\n");
-    printf("  -b\tbuffer length (default 1)\n");
-    printf("  -r\tread method (default 0 pointer, 1 callback, 2 read raw, 3 read)\n");
-    printf("  -c\tread count (default no limit)\n");
-}
-
-static void parse_options(int argc, char *argv[])
-{
-    int c;
-
-    while ((c = getopt(argc, argv, "d:t:b:r:c:h")) != -1)
+    while ((c = getopt_long(argc, argv, "Vvl:nkHp:c:u:h", long_options, &option_index)) != -1)
     {
         switch (c)
         {
-        case 'd':
-            name = optarg;
+        case 'v':
+            printf("%s", daemon_version());
+            exit(EXIT_SUCCESS);
             break;
-        case 't':
-            trigger_str = optarg;
+        case 'V':
+            verbose_flag = 1;
             break;
-        case 'b':
-            buffer_length = atoi(optarg);
+        case 'l':
+            log_level = strtol(optarg, 0, 10);
             break;
-        case 'r':
-            if (atoi(optarg) >= 0 && atoi(optarg) < MAX_READ_METHOD)
-            {
-                buffer_read_method = atoi(optarg);
-            }
-            else
-            {
-                usage(argc, argv);
-                exit(1);
-            }
+        case 'n':
+            printf("Not daemonizing!\n");
+            daemon_flag = 0;
             break;
-        case 'c':
-            if (atoi(optarg) > 0)
-            {
-                count = atoi(optarg);
-            }
-            else
-            {
-                usage(argc, argv);
-                exit(1);
-            }
+        case 'k':
+            kill_flag = 1;
+            break;
+        case 'H':
+            hup_flag = 1;
+            break;
+        case 'p':
+            pidFile = optarg;
+            break;
+        case 'u':
+            uri = optarg;
+            printf("Using URI: %s\n", uri);
             break;
         case 'h':
+            PrintUsage(argc, argv);
+            exit(EXIT_SUCCESS);
+            break;
         default:
-            usage(argc, argv);
-            exit(1);
-        }
-    }
-}
-
-/* simple configuration and streaming */
-int main(int argc, char **argv)
-{
-    // Hardware trigger
-    struct iio_device *trigger;
-
-    parse_options(argc, argv);
-
-    // Listen to ctrl+c and assert
-    signal(SIGINT, handle_sig);
-
-    unsigned int i, j, major, minor;
-    char git_tag[8];
-    iio_library_get_version(&major, &minor, git_tag);
-    printf("Library version: %u.%u (git tag: %s)\n", major, minor, git_tag);
-
-    /* check for struct iio_data_format.repeat support
-	 * 0.8 has repeat support, so anything greater than that */
-    has_repeat = ((major * 10000) + minor) >= 8 ? true : false;
-
-    printf("* Acquiring IIO context\n");
-    IIO_ENSURE((ctx = iio_create_default_context()) && "No context");
-    IIO_ENSURE(iio_context_get_devices_count(ctx) > 0 && "No devices");
-
-    printf("* Acquiring device %s\n", name);
-    dev = iio_context_find_device(ctx, name);
-    if (!dev)
-    {
-        perror("No device found");
-        shutdown();
-    }
-
-    printf("* Initializing IIO streaming channels:\n");
-    for (i = 0; i < iio_device_get_channels_count(dev); ++i)
-    {
-        struct iio_channel *chn = iio_device_get_channel(dev, i);
-        if (iio_channel_is_scan_element(chn))
-        {
-            printf("%s\n", iio_channel_get_id(chn));
-            channel_count++;
-        }
-    }
-    if (channel_count == 0)
-    {
-        printf("No scan elements found (make sure the driver built with 'CONFIG_IIO_SIMPLE_DUMMY_BUFFER=y')\n");
-        shutdown();
-    }
-    channels = calloc(channel_count, sizeof *channels);
-    if (!channels)
-    {
-        perror("Channel array allocation failed");
-        shutdown();
-    }
-    for (i = 0; i < channel_count; ++i)
-    {
-        struct iio_channel *chn = iio_device_get_channel(dev, i);
-        if (iio_channel_is_scan_element(chn))
-            channels[i] = chn;
-    }
-
-    printf("* Acquiring trigger %s\n", trigger_str);
-    trigger = iio_context_find_device(ctx, trigger_str);
-    if (!trigger || !iio_device_is_trigger(trigger))
-    {
-        perror("No trigger found (try setting up the iio-trig-hrtimer module)");
-        shutdown();
-    }
-
-    printf("* Enabling IIO streaming channels for buffered capture\n");
-    for (i = 0; i < channel_count; ++i)
-        iio_channel_enable(channels[i]);
-
-    printf("* Enabling IIO buffer trigger\n");
-    if (iio_device_set_trigger(dev, trigger))
-    {
-        perror("Could not set trigger\n");
-        shutdown();
-    }
-
-    printf("* Creating non-cyclic IIO buffers with %d samples\n", buffer_length);
-    rxbuf = iio_device_create_buffer(dev, buffer_length, false);
-    if (!rxbuf)
-    {
-        perror("Could not create buffer");
-        shutdown();
-    }
-
-    printf("* Starting IO streaming (press CTRL+C to cancel)\n");
-    bool has_ts = strcmp(iio_channel_get_id(channels[channel_count - 1]), "timestamp") == 0;
-    int64_t last_ts = 0;
-    while (!stop)
-    {
-        ssize_t nbytes_rx;
-        /* we use a char pointer, rather than a void pointer, for p_dat & p_end
-		 * to ensure the compiler understands the size is a byte, and then we
-		 * can do math on it.
-		 */
-        char *p_dat, *p_end;
-        ptrdiff_t p_inc;
-        int64_t now_ts;
-
-        // Refill RX buffer
-        nbytes_rx = iio_buffer_refill(rxbuf);
-        if (nbytes_rx < 0)
-        {
-            printf("Error refilling buf: %d\n", (int)nbytes_rx);
-            shutdown();
-        }
-
-        p_inc = iio_buffer_step(rxbuf);
-        p_end = iio_buffer_end(rxbuf);
-
-        // Print timestamp delta in ms
-        if (has_ts)
-            for (p_dat = iio_buffer_first(rxbuf, channels[channel_count - 1]); p_dat < p_end; p_dat += p_inc)
-            {
-                now_ts = (((int64_t *)p_dat)[0]);
-                printf("[%04" PRId64 "] ", last_ts > 0 ? (now_ts - last_ts) / 1000 / 1000 : 0);
-                last_ts = now_ts;
-            }
-
-        // Print each captured sample
-        switch (buffer_read_method)
-        {
-        case BUFFER_POINTER:
-            for (i = 0; i < channel_count; ++i)
-            {
-                const struct iio_data_format *fmt = iio_channel_get_data_format(channels[i]);
-                unsigned int repeat = has_repeat ? fmt->repeat : 1;
-
-                printf("%s ", iio_channel_get_id(channels[i]));
-                for (p_dat = iio_buffer_first(rxbuf, channels[i]); p_dat < p_end; p_dat += p_inc)
-                {
-                    for (j = 0; j < repeat; ++j)
-                    {
-                        if (fmt->length / 8 == sizeof(int16_t))
-                            printf("%" PRIi16 " ", ((int16_t *)p_dat)[j]);
-                        else if (fmt->length / 8 == sizeof(int64_t))
-                            printf("%" PRId64 " ", ((int64_t *)p_dat)[j]);
-                    }
-                }
-            }
-            printf("\n");
-            break;
-
-        case SAMPLE_CALLBACK:
-        {
-            int ret;
-            ret = iio_buffer_foreach_sample(rxbuf, sample_cb, NULL);
-            if (ret < 0)
-            {
-                char buf[256];
-                iio_strerror(-ret, buf, sizeof(buf));
-                fprintf(stderr, "%s while processing buffer\n", buf);
-            }
-            printf("\n");
             break;
         }
-        case CHANNEL_READ_RAW:
-        case CHANNEL_READ:
-            for (i = 0; i < channel_count; ++i)
-            {
-                uint8_t *buf;
-                size_t sample, bytes;
-                const struct iio_data_format *fmt = iio_channel_get_data_format(channels[i]);
-                unsigned int repeat = has_repeat ? fmt->repeat : 1;
-                size_t sample_size = fmt->length / 8 * repeat;
-
-                buf = malloc(sample_size * buffer_length);
-                if (!buf)
-                {
-                    perror("trying to allocate memory for buffer\n");
-                    shutdown();
-                }
-
-                if (buffer_read_method == CHANNEL_READ_RAW)
-                    bytes = iio_channel_read_raw(channels[i], rxbuf, buf, sample_size * buffer_length);
-                else
-                    bytes = iio_channel_read(channels[i], rxbuf, buf, sample_size * buffer_length);
-
-                printf("%s ", iio_channel_get_id(channels[i]));
-                for (sample = 0; sample < bytes / sample_size; ++sample)
-                {
-                    for (j = 0; j < repeat; ++j)
-                    {
-                        if (fmt->length / 8 == sizeof(int16_t))
-                            printf("%" PRIi16 " ", ((int16_t *)buf)[sample + j]);
-                        else if (fmt->length / 8 == sizeof(int64_t))
-                            printf("%" PRId64 " ", ((int64_t *)buf)[sample + j]);
-                    }
-                }
-
-                free(buf);
-            }
-            printf("\n");
-            break;
-        }
-
-        if (count != -1 && --count == 0)
-            break;
     }
 
-    shutdown();
+    if (optind < argc)
+        device = argv[optind];
 
+    if (device == 0)
+        fprintf(stderr, "please provide me with correct device");
+
+    pid_t pid = read_pid_file(pidFile);
+    errsv = errno;
+
+    if (pid > 0)
+    {
+        ret = kill(pid, 0);
+        if (ret == -1)
+        {
+            fprintf(stderr, "%s : %s pid file exists, but the process doesn't!\n", PACKAGE_NAME, pidFile);
+
+            if (kill_flag || hup_flag)
+                goto quit;
+
+            unlink(pidFile);
+        }
+        else
+        {
+            /** check if -k (kill) passed*/
+            if (kill_flag)
+            {
+                kill(pid, SIGTERM);
+                goto quit;
+            }
+
+            /** check if -h (hup) passed*/
+            if (hup_flag)
+            {
+                kill(pid, SIGHUP);
+                goto quit;
+            }
+        }
+    }
+
+    if (daemon_flag)
+    {
+        daemonize("/", 0);
+        pid = create_pid_file(pidFile);
+    }
+    else
+        openlog(PACKAGE_NAME, LOG_PERROR, LOG_DAEMON);
+
+    /** setup signals */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGQUIT);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGPIPE);
+    sigaddset(&mask, SIGCHLD);
+
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1)
+    {
+        syslog(LOG_ERR, "Could not register signal handlers (%s).", strerror(errno));
+        goto unlink_pid;
+    }
+
+    sigfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+
+    /** set log level */
+    setlogmask(LOG_UPTO(log_level));
+
+    if (uri == 0)
+        ret = local_loop(device);
+    else
+        ret = libiio_loop(uri, "icm20608");
+
+// cleanup:
+unlink_pid:
+    unlink(pidFile);
+
+quit:
     return 0;
 }
