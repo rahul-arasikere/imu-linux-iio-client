@@ -109,7 +109,7 @@ enum
     CHANNEL_READ,
     MAX_READ_METHOD,
 };
-static int buffer_read_method = BUFFER_POINTER;
+static int buffer_read_method = CHANNEL_READ;
 
 // Streaming devices
 static struct iio_device *dev;
