@@ -1,2 +1,2 @@
-iio_client: iio_client.c;
-	gcc -o iio_client iio_client.c -liio
+iio_client: iio_client.c udplink.c;
+	gcc -o iio_client iio_client.c udplink.c -liio

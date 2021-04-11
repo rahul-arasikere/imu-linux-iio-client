@@ -1,447 +1,311 @@
 /*
- * libiio - Dummy IIO streaming example
+ * readsensors - read the imu and the mag
  *
- * This example libiio program is meant to exercise the features of IIO present
- * in the sample dummy IIO device. For buffered access it relies on the hrtimer
- * trigger but could be modified to use the sysfs trigger. No hardware should
- * be required to run this program.
+ * Derived from examples/ad9361-iiostream.c
+ * Copyright (C) 2017
+ * Author: Bandan Das <bsd@makefile.in>
  *
- * Copyright (c) 2016, DAQRI. All rights reserved.
- * Author: Lucas Magasweran <lucas.magasweran@daqri.com>
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- * Based on AD9361 example:
- * Copyright (C) 2014 IABG mbH
- * Author: Michael Feilen <feilen_at_iabg.de>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
- */
-
-/*
- * How to setup the sample IIO dummy device and hrtimer trigger:
- *
- * 1. Check if `configfs` is already mounted
- *
- * $ mount | grep 'config'
- * configfs on /sys/kernel/config type configfs (rw,relatime)
- *
- * 1.b. Mount `configfs` if it is not already mounted
- *  $ sudo mount -t configfs none /sys/kernel/config
- *
- * 2. Load modules one by one
- *
- * $ sudo modprobe industrialio
- * $ sudo modprobe industrialio-configfs
- * $ sudo modprobe industrialio-sw-device
- * $ sudo modprobe industrialio-sw-trigger
- * $ sudo modprobe iio-trig-hrtimer
- * $ sudo modprobe iio_dummy
- *
- * 3. Create trigger and dummy device under `/sys/kernel/config`
- *
- * $ sudo mkdir /sys/kernel/config/iio/triggers/hrtimer/instance1
- * $ sudo mkdir /sys/kernel/config/iio/devices/dummy/my_dummy_device
- *
- * 4. Run `iio_info` to see that all worked properly
- *
- * $ iio_info
- * Library version: 0.14 (git tag: c9909f2)
- * Compiled with backends: local xml ip
- * IIO context created with local backend.
- * Backend version: 0.14 (git tag: c9909f2)
- * Backend description string: Linux ...
- * IIO context has 1 attributes:
- *         local,kernel: 4.13.0-39-generic
- * IIO context has 2 devices:
- *         iio:device0: my_dummy_device
- *                 10 channels found:
- *                         activity_walking:  (input)
- *                         1 channel-specific attributes found:
- *                                 attr  0: input value: 4
- * ...
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
  **/
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <signal.h>
 #include <stdio.h>
-#include <errno.h>
-#include <getopt.h>
-#include <inttypes.h>
 #include <iio.h>
+#include <assert.h>
+#include "udplink.h"
+#include <sys/time.h>
+#include <unistd.h>
 
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define DEBUG
 
-#define IIO_ENSURE(expr)                                                             \
-    {                                                                                \
-        if (!(expr))                                                                 \
-        {                                                                            \
-            (void)fprintf(stderr, "assertion failed (%s:%d)\n", __FILE__, __LINE__); \
-            (void)abort();                                                           \
-        }                                                                            \
-    }
+#ifdef DEBUG
+#define pr_dbg(fmt, ...)                                   \
+    do                                                     \
+    {                                                      \
+        fprintf(stderr, "iio_debug: " fmt, ##__VA_ARGS__); \
+    } while (0)
+#else
+#define pr_dbg(fmt, ...) \
+    do                   \
+    {                    \
+    } while (0)
+#endif
 
-static char *name = "mpu6050";
-static char *trigger_str = "trigger0";
-static int buffer_length = 1;
-static int count = -1;
+/* BMI 160 definitions */
+#define IMU "mpu6050"
+#define ACCEL_X "accel_x"
+#define ACCEL_Y "accel_y"
+#define ACCEL_Z "accel_z"
+#define ANGVL_X "anglvel_x"
+#define ANGVL_Y "anglvel_y"
+#define ANGVL_Z "anglvel_z"
 
-// libiio supports multiple methods for reading data from a buffer
-enum
+/* BMM 150 definitions */
+#define MAG "bmc150_magn"
+#define MAG_X "magn_x"
+#define MAG_Y "magn_y"
+#define MAG_Z "magn_z"
+
+typedef struct
 {
-    BUFFER_POINTER,
-    SAMPLE_CALLBACK,
-    CHANNEL_READ_RAW,
-    CHANNEL_READ,
-    MAX_READ_METHOD,
-};
-static int buffer_read_method = BUFFER_POINTER;
+    double timestamp;
+    double imu_angular_velocity_rpy[3];
+    double imu_linear_acceleration_xyz[3];
+    double imu_orientation_quat[4];
+    double velocity_xyz[3];
+    double position_xyz[3];
+} fdm_packet;
 
-// Streaming devices
-static struct iio_device *dev;
+static udpLink_t stateLink;
 
-/* IIO structs required for streaming */
-static struct iio_context *ctx;
-static struct iio_buffer *rxbuf;
-static struct iio_channel **channels;
-static unsigned int channel_count;
+static bool enable_failed = false;
 
-static bool stop;
-static bool has_repeat;
+static struct iio_context *ctx = NULL;
+static struct iio_buffer *imubuf = NULL;
+static struct iio_buffer *magbuf = NULL;
+bool stop = false;
 
-/* cleanup and exit */
-static void shutdown()
+static double accel_x, accel_y, accel_z;
+static double angvl_x, angvl_y, angvl_z;
+static double mag_x, mag_y, mag_z;
+
+#define GRAVITY 9.805f
+#define SCALE 10.0f
+
+static bool get_imu_dev(struct iio_context *ctx, struct iio_device **dev)
 {
-    int ret;
-
-    if (channels)
+    *dev = iio_context_find_device(ctx, IMU);
+    if (!*dev)
     {
-        free(channels);
+        printf("Could not find MPU6050\n");
+        return false;
     }
 
-    printf("* Destroying buffers\n");
-    if (rxbuf)
+    return true;
+}
+
+static void enable_dev_channel(struct iio_device *dev, char *name)
+{
+    struct iio_channel *ch;
+
+    if (enable_failed)
+        return;
+
+    ch = iio_device_find_channel(dev, name, false);
+    if (ch == NULL)
     {
-        iio_buffer_destroy(rxbuf);
+        enable_failed = true;
+        printf("Enabling channel %s failed!\n", name);
+        return;
+    }
+    pr_dbg("Enabling channel %s\n", name);
+    iio_channel_enable(ch);
+}
+
+static void disable_imu_channel(struct iio_context *ctx, char *channel)
+{
+    struct iio_device *dev = NULL;
+    struct iio_channel *ch = NULL;
+
+    get_imu_dev(ctx, &dev);
+
+    if (!dev || !channel)
+    {
+        pr_dbg("Disabling IMU channel failed\n");
+        return;
     }
 
-    printf("* Disassociate trigger\n");
-    if (dev)
+    ch = iio_device_find_channel(dev, channel, false);
+    if (!ch)
     {
-        ret = iio_device_set_trigger(dev, NULL);
-        if (ret < 0)
-        {
-            char buf[256];
-            iio_strerror(-ret, buf, sizeof(buf));
-            fprintf(stderr, "%s while Disassociate trigger\n", buf);
-        }
+        pr_dbg("Disabling IMU channel, could not find channel\n");
+        return;
+    }
+    iio_channel_disable(ch);
+}
+
+static void process_imu_buffer(struct iio_device *dev, struct iio_buffer *buf)
+{
+    ssize_t rxn;
+    char *data;
+    struct iio_channel *ch;
+    ptrdiff_t inc;
+
+    assert(buf != NULL);
+    rxn = iio_buffer_refill(buf);
+    if (rxn < 0)
+    {
+        printf("Error filling up IMU buffer\n");
+        return;
     }
 
-    printf("* Destroying context\n");
-    if (ctx)
-    {
-        iio_context_destroy(ctx);
-    }
-    exit(0);
+    ch = iio_device_find_channel(dev, ANGVL_X, false);
+    data = iio_buffer_first(buf, ch);
+    inc = iio_buffer_step(buf);
+    angvl_x = ((int16_t *)data)[0];
+
+    data += inc;
+    angvl_y = ((int16_t *)data)[1];
+
+    data += inc;
+    angvl_z = ((int16_t *)data)[2];
+
+    data += inc;
+    accel_x = ((int16_t *)data)[3];
+
+    data += inc;
+    accel_y = ((int16_t *)data)[4];
+
+    data += inc;
+    accel_z = ((int16_t *)data)[5];
+
+#if 0	
+	ch = iio_device_find_channel(dev, ANGVL_Y, false);
+	data = iio_buffer_first(buf, ch);
+	angvl_y = ((int16_t *)data)[0];
+	
+	ch = iio_device_find_channel(dev, ANGVL_Z, false);
+	data = iio_buffer_first(buf, ch);
+	angvl_z = ((int16_t *)data)[2];
+	
+	ch = iio_device_find_channel(dev, ACCEL_X, false);
+	data = iio_buffer_first(buf, ch);
+	accel_x = ((int16_t *)data)[3];
+
+	ch = iio_device_find_channel(dev, ACCEL_Y, false);
+	data = iio_buffer_first(buf, ch);
+	accel_y = ((int16_t *)data)[5];
+
+	ch = iio_device_find_channel(dev, ACCEL_Z, false);
+	data = iio_buffer_first(buf, ch);
+	accel_z = ((int16_t *)data)[3];
+#endif
+
+    pr_dbg("Accel: x is %f, y is %f, z is %f\n", accel_x, accel_y, accel_z);
+    pr_dbg("Angular: x is %d, y is %d, z is %d\n", angvl_x, angvl_y, angvl_z);
+    accel_x *= GRAVITY / 4096.f;
+    accel_y *= GRAVITY / 4096.f;
+    accel_z *= GRAVITY / 4096.f;
+    angvl_x *= 1.f / 16.4f;
+    angvl_y *= 1.f / 16.4f;
+    angvl_z *= 1.f / 16.4f;
+    pr_dbg("Accel: x is %f, y is %f, z is %f\n", accel_x, accel_y, accel_z);
+    pr_dbg("Angular: x is %f, y is %f, z is %f\n", angvl_x, angvl_y, angvl_z);
 }
 
 static void handle_sig(int sig)
 {
-    printf("Waiting for process to finish... got signal : %d\n", sig);
+    printf("Waiting for process to finish...\n");
     stop = true;
 }
 
-static ssize_t sample_cb(const struct iio_channel *chn, void *src, size_t bytes, __notused void *d)
-{
-    const struct iio_data_format *fmt = iio_channel_get_data_format(chn);
-    unsigned int j, repeat = has_repeat ? fmt->repeat : 1;
-
-    printf("%s ", iio_channel_get_id(chn));
-    for (j = 0; j < repeat; ++j)
-    {
-        if (bytes == sizeof(int16_t))
-            printf("%" PRIi16 " ", ((int16_t *)src)[j]);
-        else if (bytes == sizeof(int64_t))
-            printf("%" PRId64 " ", ((int64_t *)src)[j]);
-    }
-
-    return bytes * repeat;
-}
-
-static void usage(__notused int argc, char *argv[])
-{
-    printf("Usage: %s [OPTION]\n", argv[0]);
-    printf("  -d\tdevice name (default \"iio_dummy_part_no\")\n");
-    printf("  -t\ttrigger name (default \"instance1\")\n");
-    printf("  -b\tbuffer length (default 1)\n");
-    printf("  -r\tread method (default 0 pointer, 1 callback, 2 read raw, 3 read)\n");
-    printf("  -c\tread count (default no limit)\n");
-}
-
-static void parse_options(int argc, char *argv[])
-{
-    int c;
-
-    while ((c = getopt(argc, argv, "d:t:b:r:c:h")) != -1)
-    {
-        switch (c)
-        {
-        case 'd':
-            name = optarg;
-            break;
-        case 't':
-            trigger_str = optarg;
-            break;
-        case 'b':
-            buffer_length = atoi(optarg);
-            break;
-        case 'r':
-            if (atoi(optarg) >= 0 && atoi(optarg) < MAX_READ_METHOD)
-            {
-                buffer_read_method = atoi(optarg);
-            }
-            else
-            {
-                usage(argc, argv);
-                exit(1);
-            }
-            break;
-        case 'c':
-            if (atoi(optarg) > 0)
-            {
-                count = atoi(optarg);
-            }
-            else
-            {
-                usage(argc, argv);
-                exit(1);
-            }
-            break;
-        case 'h':
-        default:
-            usage(argc, argv);
-            exit(1);
-        }
-    }
-}
-
-/* simple configuration and streaming */
 int main(int argc, char **argv)
 {
-    // Hardware trigger
-    struct iio_device *trigger;
 
-    parse_options(argc, argv);
+    struct iio_device *imu = NULL;
+    struct iio_device *mag = NULL;
+    struct timeval tv;
+    fdm_packet pkt;
 
-    // Listen to ctrl+c and assert
+    // Listen to ctrl+c and ASSERT
     signal(SIGINT, handle_sig);
 
-    unsigned int i, j, major, minor;
-    char git_tag[8];
-    iio_library_get_version(&major, &minor, git_tag);
-    printf("Library version: %u.%u (git tag: %s)\n", major, minor, git_tag);
+    pr_dbg("Acquiring IIO context\n");
+    ctx = iio_create_default_context();
 
-    /* check for struct iio_data_format.repeat support
-	 * 0.8 has repeat support, so anything greater than that */
-    has_repeat = ((major * 10000) + minor) >= 8 ? true : false;
-
-    printf("* Acquiring IIO context\n");
-    IIO_ENSURE((ctx = iio_create_default_context()) && "No context");
-    IIO_ENSURE(iio_context_get_devices_count(ctx) > 0 && "No devices");
-
-    printf("* Acquiring device %s\n", name);
-    dev = iio_context_find_device(ctx, name);
-    if (!dev)
+    if (ctx == NULL)
     {
-        perror("No device found");
-        shutdown();
+        printf("Could not acquire IIO context\n");
+        goto done;
+    }
+    if (!iio_context_get_devices_count(ctx))
+    {
+        printf("No IIO devices found!\n");
+        goto ctx_destroy;
     }
 
-    printf("* Initializing IIO streaming channels:\n");
-    for (i = 0; i < iio_device_get_channels_count(dev); ++i)
+    pr_dbg("Finding IMU device\n");
+    if (!get_imu_dev(ctx, &imu))
     {
-        struct iio_channel *chn = iio_device_get_channel(dev, i);
-        if (iio_channel_is_scan_element(chn))
-        {
-            printf("%s\n", iio_channel_get_id(chn));
-            channel_count++;
-        }
-    }
-    if (channel_count == 0)
-    {
-        printf("No scan elements found (make sure the driver built with 'CONFIG_IIO_SIMPLE_DUMMY_BUFFER=y')\n");
-        shutdown();
-    }
-    channels = calloc(channel_count, sizeof *channels);
-    if (!channels)
-    {
-        perror("Channel array allocation failed");
-        shutdown();
-    }
-    for (i = 0; i < channel_count; ++i)
-    {
-        struct iio_channel *chn = iio_device_get_channel(dev, i);
-        if (iio_channel_is_scan_element(chn))
-            channels[i] = chn;
+        printf("Could not find IMU device!\n");
+        goto ctx_destroy;
     }
 
-    printf("* Acquiring trigger %s\n", trigger_str);
-    trigger = iio_context_find_device(ctx, trigger_str);
-    if (!trigger || !iio_device_is_trigger(trigger))
+    pr_dbg("Configuring IMU channels\n");
+    enable_dev_channel(imu, ACCEL_X);
+    enable_dev_channel(imu, ACCEL_Y);
+    enable_dev_channel(imu, ACCEL_Z);
+    enable_dev_channel(imu, ANGVL_X);
+    enable_dev_channel(imu, ANGVL_Y);
+    enable_dev_channel(imu, ANGVL_Z);
+
+    if (enable_failed)
     {
-        perror("No trigger found (try setting up the iio-trig-hrtimer module)");
-        shutdown();
+        pr_dbg("Exiting since enabling one of the IMU channels failed\n");
+        goto ctx_destroy;
+    }
+    enable_failed = false;
+
+    imubuf = iio_device_create_buffer(imu, 16, false);
+    if (!imubuf)
+    {
+        pr_dbg("Enabling IMU buffers failed!\n");
+        goto disable_imu_channel;
     }
 
-    printf("* Enabling IIO streaming channels for buffered capture\n");
-    for (i = 0; i < channel_count; ++i)
-        iio_channel_enable(channels[i]);
+    printf("Sensors Ready!\n");
+    udpInit(&stateLink, "127.0.0.1", 9003, false);
+    pr_dbg("start state link...%d\n", 0);
 
-    printf("* Enabling IIO buffer trigger\n");
-    if (iio_device_set_trigger(dev, trigger))
-    {
-        perror("Could not set trigger\n");
-        shutdown();
-    }
-
-    printf("* Creating non-cyclic IIO buffers with %d samples\n", buffer_length);
-    rxbuf = iio_device_create_buffer(dev, buffer_length, false);
-    if (!rxbuf)
-    {
-        perror("Could not create buffer");
-        shutdown();
-    }
-
-    printf("* Starting IO streaming (press CTRL+C to cancel)\n");
-    bool has_ts = strcmp(iio_channel_get_id(channels[channel_count - 1]), "timestamp") == 0;
-    int64_t last_ts = 0;
     while (!stop)
     {
-        ssize_t nbytes_rx;
-        /* we use a char pointer, rather than a void pointer, for p_dat & p_end
-		 * to ensure the compiler understands the size is a byte, and then we
-		 * can do math on it.
-		 */
-        char *p_dat, *p_end;
-        ptrdiff_t p_inc;
-        int64_t now_ts;
-
-        // Refill RX buffer
-        nbytes_rx = iio_buffer_refill(rxbuf);
-        if (nbytes_rx < 0)
+        usleep(1000 * 6);
+        process_imu_buffer(imu, imubuf);
+        if (gettimeofday(&tv, NULL) < 0)
         {
-            printf("Error refilling buf: %d\n", (int)nbytes_rx);
-            shutdown();
+            pr_dbg("gettimeofday failed\n");
+            goto buffer_destroy;
         }
 
-        p_inc = iio_buffer_step(rxbuf);
-        p_end = iio_buffer_end(rxbuf);
+        pkt.timestamp = tv.tv_sec;
+        /* set imu_angular_velocity_rpy, raw sensor data */
+        pkt.imu_angular_velocity_rpy[0] = angvl_x;
+        pkt.imu_angular_velocity_rpy[1] = angvl_y;
+        pkt.imu_angular_velocity_rpy[2] = angvl_z;
 
-        // Print timestamp delta in ms
-        if (has_ts)
-            for (p_dat = iio_buffer_first(rxbuf, channels[channel_count - 1]); p_dat < p_end; p_dat += p_inc)
-            {
-                now_ts = (((int64_t *)p_dat)[0]);
-                printf("[%04" PRId64 "] ", last_ts > 0 ? (now_ts - last_ts) / 1000 / 1000 : 0);
-                last_ts = now_ts;
-            }
-
-        // Print each captured sample
-        switch (buffer_read_method)
-        {
-        case BUFFER_POINTER:
-            for (i = 0; i < channel_count; ++i)
-            {
-                const struct iio_data_format *fmt = iio_channel_get_data_format(channels[i]);
-                unsigned int repeat = has_repeat ? fmt->repeat : 1;
-
-                printf("%s ", iio_channel_get_id(channels[i]));
-                for (p_dat = iio_buffer_first(rxbuf, channels[i]); p_dat < p_end; p_dat += p_inc)
-                {
-                    for (j = 0; j < repeat; ++j)
-                    {
-                        if (fmt->length / 8 == sizeof(int16_t))
-                            printf("%" PRIi16 " ", ((int16_t *)p_dat)[j]);
-                        else if (fmt->length / 8 == sizeof(int64_t))
-                            printf("%" PRId64 " ", ((int64_t *)p_dat)[j]);
-                    }
-                }
-            }
-            printf("\n");
-            break;
-
-        case SAMPLE_CALLBACK:
-        {
-            int ret;
-            ret = iio_buffer_foreach_sample(rxbuf, sample_cb, NULL);
-            if (ret < 0)
-            {
-                char buf[256];
-                iio_strerror(-ret, buf, sizeof(buf));
-                fprintf(stderr, "%s while processing buffer\n", buf);
-            }
-            printf("\n");
-            break;
-        }
-        case CHANNEL_READ_RAW:
-        case CHANNEL_READ:
-            for (i = 0; i < channel_count; ++i)
-            {
-                uint8_t *buf;
-                size_t sample, bytes;
-                const struct iio_data_format *fmt = iio_channel_get_data_format(channels[i]);
-                unsigned int repeat = has_repeat ? fmt->repeat : 1;
-                size_t sample_size = fmt->length / 8 * repeat;
-
-                buf = malloc(sample_size * buffer_length);
-                if (!buf)
-                {
-                    perror("trying to allocate memory for buffer\n");
-                    shutdown();
-                }
-
-                if (buffer_read_method == CHANNEL_READ_RAW)
-                    bytes = iio_channel_read_raw(channels[i], rxbuf, buf, sample_size * buffer_length);
-                else
-                    bytes = iio_channel_read(channels[i], rxbuf, buf, sample_size * buffer_length);
-
-                printf("%s ", iio_channel_get_id(channels[i]));
-                for (sample = 0; sample < bytes / sample_size; ++sample)
-                {
-                    for (j = 0; j < repeat; ++j)
-                    {
-                        if (fmt->length / 8 == sizeof(int16_t))
-                            printf("%" PRIi16 " ", ((int16_t *)buf)[sample + j]);
-                        else if (fmt->length / 8 == sizeof(int64_t))
-                            printf("%" PRId64 " ", ((int64_t *)buf)[sample + j]);
-                    }
-                }
-
-                free(buf);
-            }
-            printf("\n");
-            break;
-        }
-
-        if (count != -1 && --count == 0)
-            break;
+        /* set imu_linear_acceleration_xyz, raw sensor data */
+        pkt.imu_linear_acceleration_xyz[0] = accel_x;
+        pkt.imu_linear_acceleration_xyz[1] = accel_y;
+        pkt.imu_linear_acceleration_xyz[2] = accel_z;
+        /* send udp datagram */
+        udpSend(&stateLink, &pkt, sizeof(pkt));
     }
 
-    shutdown();
-
+buffer_destroy:
+    if (imubuf)
+        iio_buffer_destroy(imubuf);
+disable_imu_channel:
+    disable_imu_channel(ctx, ACCEL_X);
+    disable_imu_channel(ctx, ACCEL_Y);
+    disable_imu_channel(ctx, ACCEL_Z);
+    disable_imu_channel(ctx, ANGVL_X);
+    disable_imu_channel(ctx, ANGVL_Y);
+    disable_imu_channel(ctx, ANGVL_Z);
+ctx_destroy:
+    if (ctx)
+        iio_context_destroy(ctx);
+done:
     return 0;
 }
