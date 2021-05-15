@@ -131,17 +131,16 @@ int main(int argc, char **argv)
     {
         if (iio_buffer_refill(accgyro_buffer) > 0)
         {
-            iio_channel_read_raw(accel_x, accgyro_buffer, &raw_accel_x, sizeof(int16_t));
-            iio_channel_read_raw(accel_y, accgyro_buffer, &raw_accel_y, sizeof(int16_t));
-            iio_channel_read_raw(accel_z, accgyro_buffer, &raw_accel_z, sizeof(int16_t));
-            iio_channel_read_raw(gyro_anglvel_x, accgyro_buffer, &raw_gyro_x, sizeof(int16_t));
-            iio_channel_read_raw(gyro_anglvel_y, accgyro_buffer, &raw_gyro_y, sizeof(int16_t));
-            iio_channel_read_raw(gyro_anglvel_z, accgyro_buffer, &raw_gyro_z, sizeof(int16_t));
-            printf("gyro_x: %x\tgyro_y:%s\tgyro_z:%x\n", raw_gyro_x, raw_gyro_y, raw_gyro_z);
-            printf("accel_x: %x\taccel_y:%s\taccel_z:%x\n", raw_accel_x, raw_accel_y, raw_accel_z);
+            iio_channel_read(accel_x, accgyro_buffer, &raw_accel_x, sizeof(int16_t));
+            iio_channel_read(accel_y, accgyro_buffer, &raw_accel_y, sizeof(int16_t));
+            iio_channel_read(accel_z, accgyro_buffer, &raw_accel_z, sizeof(int16_t));
+            iio_channel_read(gyro_anglvel_x, accgyro_buffer, &raw_gyro_x, sizeof(int16_t));
+            iio_channel_read(gyro_anglvel_y, accgyro_buffer, &raw_gyro_y, sizeof(int16_t));
+            iio_channel_read(gyro_anglvel_z, accgyro_buffer, &raw_gyro_z, sizeof(int16_t));
+            printf("gyro_x: %d\tgyro_y:%d\tgyro_z:%d\n", raw_gyro_x, raw_gyro_y, raw_gyro_z);
+            printf("accel_x: %d\taccel_y:%d\taccel_z:%d\n", raw_accel_x, raw_accel_y, raw_accel_z);
         }
     }
-clean_up_buffer:
     if (accgyro_buffer)
         iio_buffer_destroy(accgyro_buffer);
 disable_channels:
