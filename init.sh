@@ -12,6 +12,8 @@ modprobe inv-mpu6050-i2c
 
 echo mpu6050 0x68 > /sys/bus/i2c/devices/i2c-0/new_device
 
+echo 500 > /sys/bus/iio/devices/iio:device0/sampling_frequency
+
 # cd -
 
 # echo "Setting up configfs entries"
